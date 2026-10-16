@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chain Sound Monitor</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --text:#1d2733; --muted:#6b7785; --accent:#1f6feb; --bad:#d93025; --ok:#188038; --idle:#8b97a5; --line:#dde3ea; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#10151c; --card:#1a222c; --text:#e8edf3; --muted:#9aa7b5; --accent:#4c8dff; --bad:#ff6b5e; --ok:#4cc38a; --idle:#6f7c8b; --line:#2b3643; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); padding:16px; }
+  .wrap { max-width:560px; margin:0 auto; }
+  h1 { font-size:1.3rem; margin:4px 0 14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; }
+  button { flex:1 1 140px; padding:13px 14px; font-size:1rem; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  .status { display:flex; align-items:center; gap:8px; font-weight:600; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); } .dot.on { background:var(--ok); }
+  .badge { text-align:center; padding:26px 10px; border-radius:14px; background:var(--idle); color:#fff; font-size:2rem; font-weight:700; letter-spacing:.04em; transition:background .15s; }
+  .badge small { display:block; font-size:.95rem; font-weight:500; opacity:.9; letter-spacing:0; margin-top:4px; }
+  .bar { height:14px; background:var(--line); border-radius:7px; overflow:hidden; margin-top:12px; } .bar > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .hist { display:flex; gap:2px; height:26px; margin-top:6px; } .hist div { flex:1; background:var(--line); border-radius:2px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 14px; font-size:.92rem; } .grid span { color:var(--muted); } .grid b { float:right; }
+  label { display:flex; align-items:center; gap:8px; font-size:.95rem; margin-top:10px; }
+  .warn { color:var(--bad); font-size:.9rem; margin-top:8px; min-height:1.2em; }
+  .small { color:var(--muted); font-size:.85rem; line-height:1.4; }
+  #log { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:.78rem; max-height:110px; overflow:auto; white-space:pre-wrap; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Chain Sound Monitor</h1>
+
+  <div class="card">
+    <div class="status"><span class="dot" id="dot"></span><span id="status">Not connected</span></div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="btnConnect">Connect to XIAO</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+    </div>
+    <div class="warn" id="warn"></div>
+  </div>
+
+  <div class="card">
+    <div class="badge" id="badge">WAITING<small id="badgeSub">Connect to start</small></div>
+    <div class="bar"><div id="confBar"></div></div>
+    <div class="small" style="margin-top:12px">Last 60 results (oldest on the left)</div>
+    <div class="hist" id="hist"></div>
+    <label><input type="checkbox" id="chkSound" checked> Beep and vibrate on abnormal</label>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div><span>Windows classified</span><b id="sN">0</b></div>
+      <div><span>Abnormal alerts</span><b id="sAlert">0</b></div>
+      <div><span>Abnormal share</span><b id="sShare">0%</b></div>
+      <div><span>Signal level (RMS)</span><b id="sRms">-</b></div>
+      <div><span>Inference time</span><b id="sMs">-</b></div>
+      <div><span>Packets missed</span><b id="sMiss">0</b></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="btnCsv" disabled>Download CSV log</button>
+      <button id="btnReset">Reset counters</button>
+    </div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+  <p class="small">Chrome or Edge on Android or a computer, or Bluefy on iPhone. The page must be opened over HTTPS (or as a local file on a computer). Results are computed on the XIAO; no audio leaves the device.</p>
+</div>
+
+<script>
+const SVC = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const RES = "19b10010-e8f2-537e-4f6c-d104768a1214";
+const LAB = "19b10011-e8f2-537e-4f6c-d104768a1214";
+
+// ==== PARSER BEGIN ====
+// 8-byte result: class(1) | confidence %(1) | rms u16 | inference ms u16 | alert(1) | seq(1)
+function parseResult(dv) {
+  if (dv.byteLength < 8) return null;
+  return { cls: dv.getUint8(0), conf: dv.getUint8(1), rms: dv.getUint16(2, true),
+           ms: dv.getUint16(4, true), alert: dv.getUint8(6) === 1, seq: dv.getUint8(7) };
+}
+// ==== PARSER END ====
+
+const $ = id => document.getElementById(id);
+let device = null, labels = [], expected = null, missed = 0, n = 0, abnormalCount = 0, alerts = 0;
+let lastAlert = false, lastPacketAt = 0, rows = [], hist = [];
+let audioCtx = null;
+
+function log(m) { const l = $("log"); l.textContent += m + "\n"; l.scrollTop = l.scrollHeight; }
+function setStatus(t, on) { $("status").textContent = t; $("dot").className = "dot" + (on ? " on" : ""); }
+function colorFor(i) {
+  if (i === 255) return "var(--idle)";
+  const name = (labels[i] || "").toLowerCase();
+  if (name.includes("abnormal") || name.includes("loose") || name.includes("bad")) return "var(--bad)";
+  if (name.includes("normal") || name.includes("good")) return "var(--ok)";
+  return "var(--accent)";
+}
+function beep() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 880; g.gain.value = 0.15; o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.25);
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+}
+
+async function connect() {
+  $("warn").textContent = "";
+  if (!navigator.bluetooth) { $("warn").textContent = "This browser has no Web Bluetooth. Use Chrome or Edge (or Bluefy on iPhone)."; return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }, { namePrefix: "XIAO" }], optionalServices: [SVC] });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    setStatus("Connecting...");
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    const lc = await svc.getCharacteristic(LAB);
+    labels = new TextDecoder().decode(await lc.readValue()).split(",");
+    log("Classes: " + labels.join(", "));
+    const rc = await svc.getCharacteristic(RES);
+    rc.addEventListener("characteristicvaluechanged", onResult);
+    expected = null;
+    await rc.startNotifications();
+    setStatus("Connected to " + (device.name || "XIAO"), true);
+    $("btnConnect").disabled = true; $("btnDisconnect").disabled = false;
+    $("badge").firstChild.textContent = "LISTENING"; $("badgeSub").textContent = "Waiting for the first result";
+  } catch (e) { log("Error: " + e.message); $("warn").textContent = e.message; setStatus("Not connected"); }
+}
+
+function onDisconnected() {
+  setStatus("Disconnected"); $("btnConnect").disabled = false; $("btnDisconnect").disabled = true;
+  $("badge").style.background = "var(--idle)"; $("badge").firstChild.textContent = "DISCONNECTED"; $("badgeSub").textContent = "";
+  log("Disconnected");
+}
+
+function onResult(e) {
+  const r = parseResult(e.target.value); if (!r) return;
+  lastPacketAt = performance.now();
+  if (expected !== null && r.seq !== expected) missed += (r.seq - expected + 256) & 255;
+  expected = (r.seq + 1) & 255;
+  n++;
+  const silent = r.cls === 255;
+  const name = silent ? "NO SIGNAL" : (labels[r.cls] || ("class " + r.cls)).toUpperCase();
+  $("badge").style.background = colorFor(r.cls);
+  $("badge").firstChild.textContent = name;
+  $("badgeSub").textContent = silent ? "Too quiet to classify" : "confidence " + r.conf + "%";
+  $("confBar").style.width = (silent ? 0 : r.conf) + "%";
+  if (!silent && (labels[r.cls] || "").toLowerCase() === "abnormal") abnormalCount++;
+  if (r.alert && !lastAlert) { alerts++; if ($("chkSound").checked) beep(); }
+  lastAlert = r.alert;
+  hist.push(colorFor(r.cls)); if (hist.length > 60) hist.shift();
+  rows.push([new Date().toISOString(), silent ? "silent" : labels[r.cls], r.conf, r.rms, r.ms, r.alert ? 1 : 0]);
+  $("btnCsv").disabled = false;
+  $("sN").textContent = n; $("sAlert").textContent = alerts; $("sMiss").textContent = missed;
+  $("sShare").textContent = Math.round(100 * abnormalCount / n) + "%";
+  $("sRms").textContent = r.rms; $("sMs").textContent = r.ms + " ms";
+  const h = $("hist"); h.innerHTML = "";
+  for (let i = 0; i < 60; i++) { const d = document.createElement("div"); if (hist[i]) d.style.background = hist[i]; h.appendChild(d); }
+}
+
+function downloadCsv() {
+  const head = "time,class,confidence_percent,rms,inference_ms,alert\n";
+  const blob = new Blob([head + rows.map(r => r.join(",")).join("\n")], { type: "text/csv" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = "chain_log_" + new Date().toISOString().replace(/[:.]/g, "-") + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+}
+function resetAll() {
+  n = 0; abnormalCount = 0; alerts = 0; missed = 0; rows = []; hist = [];
+  ["sN", "sAlert", "sMiss"].forEach(i => $(i).textContent = "0"); $("sShare").textContent = "0%";
+  $("hist").innerHTML = ""; $("btnCsv").disabled = true;
+}
+
+$("btnConnect").onclick = connect;
+$("btnDisconnect").onclick = () => { if (device && device.gatt.connected) device.gatt.disconnect(); };
+$("btnCsv").onclick = downloadCsv;
+$("btnReset").onclick = resetAll;
+setInterval(() => {
+  if (device && device.gatt.connected && lastPacketAt && performance.now() - lastPacketAt > 3000) $("badgeSub").textContent = "No data for 3 s";
+}, 1000);
+</script>
+</body>
+</html>
